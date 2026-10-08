@@ -1,4 +1,4 @@
-from _future_ import annotations
+from __future__ import annotations
 
 import calendar
 import csv
@@ -13,7 +13,7 @@ import plotly.express as px
 import streamlit as st
 
 
-DB_PATH = Path(_file_).resolve().parent / "finanzas.db"
+DB_PATH = Path(__file__).resolve().parent / "finanzas.db"
 
 GASTOS = [
     "Movilidad/transporte", "Comida", "Vivienda", "Ocio", "Salud",
@@ -968,5 +968,5 @@ def main() -> None:
         mostrar_reportes(perfil_id)
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()

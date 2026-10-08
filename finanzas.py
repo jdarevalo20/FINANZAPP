@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import calendar
 import csv
+import hashlib
+import hmac
 import io
+import re
+import secrets
 import sqlite3
 from datetime import date, datetime, time
 from pathlib import Path
@@ -13,960 +17,1184 @@ import plotly.express as px
 import streamlit as st
 
 
-DB_PATH = Path(__file__).resolve().parent / "finanzas.db"
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "finanzas.db"
+PASSWORD_HASH_ITERATIONS = 600_000
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,30}$")
 
-GASTOS = [
-    "Movilidad/transporte", "Comida", "Vivienda", "Ocio", "Salud",
-    "Educación", "Deudas", "Servicios", "Otros",
+EXPENSE_CATEGORIES = [
+    "Movilidad/transporte",
+    "Comida",
+    "Vivienda",
+    "Ocio",
+    "Salud",
+    "Educación",
+    "Deudas",
+    "Servicios",
+    "Otros",
 ]
-INGRESOS = ["Salario", "Ventas", "Inversiones", "Freelance", "Otros"]
-METODOS = [
-    "Efectivo", "Tarjeta Débito", "Tarjeta de Crédito", "Addi",
+
+INCOME_CATEGORIES = ["Salario", "Ventas", "Inversiones", "Freelance", "Otros"]
+
+PAYMENT_METHODS = [
+    "Efectivo",
+    "Tarjeta Débito",
+    "Tarjeta de Crédito",
+    "Addi",
     "Transferencias",
 ]
-MESES = [
-    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+
+MONTHS = [
+    "Enero",
+    "Febrero",
+    "Marzo",
+    "Abril",
+    "Mayo",
+    "Junio",
+    "Julio",
+    "Agosto",
+    "Septiembre",
+    "Octubre",
+    "Noviembre",
+    "Diciembre",
 ]
 
 
-def conectar() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    return db
+def connect_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
 
 
-def inicializar_base() -> None:
-    with conectar() as db:
-        db.executescript(
+def initialize_db() -> None:
+    connection = connect_db()
+    try:
+        connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS perfiles (
+            CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT NOT NULL COLLATE NOCASE UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS movimientos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
-                tipo TEXT NOT NULL CHECK(tipo IN ('Ingreso', 'Gasto')),
-                descripcion TEXT NOT NULL,
-                monto REAL NOT NULL CHECK(monto > 0),
-                categoria TEXT NOT NULL,
-                metodo_pago TEXT NOT NULL,
-                fecha_hora TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS indice_movimientos_perfil_fecha
-                ON movimientos(perfil_id, fecha_hora);
-
-            CREATE TABLE IF NOT EXISTS presupuestos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
-                mes TEXT NOT NULL,
-                ingresos_proyectados REAL NOT NULL DEFAULT 0
-                    CHECK(ingresos_proyectados >= 0),
-                UNIQUE(perfil_id, mes)
-            );
-
-            CREATE TABLE IF NOT EXISTS obligaciones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
-                nombre TEXT NOT NULL,
-                monto REAL NOT NULL CHECK(monto > 0),
-                dia_limite INTEGER NOT NULL CHECK(dia_limite BETWEEN 1 AND 31)
-            );
-
-            CREATE TABLE IF NOT EXISTS deudas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
-                acreedor TEXT NOT NULL,
-                deuda_total REAL NOT NULL CHECK(deuda_total > 0),
-                saldo_pendiente REAL NOT NULL CHECK(saldo_pendiente >= 0),
-                tasa_interes REAL NOT NULL DEFAULT 0 CHECK(tasa_interes >= 0),
-                cuotas_totales INTEGER NOT NULL CHECK(cuotas_totales > 0),
-                cuotas_pendientes INTEGER NOT NULL CHECK(cuotas_pendientes >= 0),
-                cuota_mensual REAL NOT NULL CHECK(cuota_mensual > 0),
-                dia_limite INTEGER NOT NULL CHECK(dia_limite BETWEEN 1 AND 31)
-            );
-
-            CREATE TABLE IF NOT EXISTS metas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                perfil_id INTEGER NOT NULL REFERENCES perfiles(id) ON DELETE CASCADE,
-                nombre TEXT NOT NULL,
-                monto_objetivo REAL NOT NULL CHECK(monto_objetivo > 0),
-                monto_ahorrado REAL NOT NULL DEFAULT 0 CHECK(monto_ahorrado >= 0),
-                fecha_objetivo TEXT
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                password_iterations INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
-        cantidad = db.execute("SELECT COUNT(*) FROM perfiles").fetchone()[0]
-        if cantidad == 0:
-            db.execute("INSERT INTO perfiles (nombre) VALUES (?)", ("Personal",))
+
+        profiles_exist = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'profiles'"
+        ).fetchone()
+
+        if profiles_exist:
+            profile_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(profiles)"
+                ).fetchall()
+            }
+
+            if "user_id" not in profile_columns:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE profiles_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                        name TEXT NOT NULL COLLATE NOCASE,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO profiles_new (id, user_id, name, created_at)
+                        SELECT id, NULL, name, created_at FROM profiles;
+                    DROP TABLE profiles;
+                    ALTER TABLE profiles_new RENAME TO profiles;
+                    COMMIT;
+                    """
+                )
+                connection.execute("PRAGMA foreign_keys = ON")
+        else:
+            connection.execute(
+                """
+                CREATE TABLE profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_user_name
+            ON profiles(user_id, name COLLATE NOCASE)
+            """
+        )
+
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('Ingreso', 'Gasto')),
+                description TEXT NOT NULL,
+                amount REAL NOT NULL CHECK(amount > 0),
+                category TEXT NOT NULL,
+                payment_method TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transactions_profile_date
+                ON transactions(profile_id, occurred_at);
+
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                month TEXT NOT NULL,
+                projected_income REAL NOT NULL DEFAULT 0
+                    CHECK(projected_income >= 0),
+                UNIQUE(profile_id, month)
+            );
+
+            CREATE TABLE IF NOT EXISTS obligations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                amount REAL NOT NULL CHECK(amount > 0),
+                due_day INTEGER NOT NULL CHECK(due_day BETWEEN 1 AND 31)
+            );
+
+            CREATE TABLE IF NOT EXISTS debts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                creditor TEXT NOT NULL,
+                total_amount REAL NOT NULL CHECK(total_amount > 0),
+                remaining_balance REAL NOT NULL CHECK(remaining_balance >= 0),
+                interest_rate REAL NOT NULL DEFAULT 0 CHECK(interest_rate >= 0),
+                total_installments INTEGER NOT NULL CHECK(total_installments > 0),
+                installments_left INTEGER NOT NULL CHECK(installments_left >= 0),
+                monthly_payment REAL NOT NULL CHECK(monthly_payment > 0),
+                due_day INTEGER NOT NULL CHECK(due_day BETWEEN 1 AND 31),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                target_amount REAL NOT NULL CHECK(target_amount > 0),
+                saved_amount REAL NOT NULL DEFAULT 0 CHECK(saved_amount >= 0),
+                deadline TEXT
+            );
+            """
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
-def consultar(sql: str, parametros: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    with conectar() as db:
-        return list(db.execute(sql, parametros).fetchall())
+def fetch_all(
+    sql: str, params: tuple[Any, ...] = ()
+) -> list[sqlite3.Row]:
+    with connect_db() as connection:
+        return list(connection.execute(sql, params).fetchall())
 
 
-def ejecutar(sql: str, parametros: tuple[Any, ...] = ()) -> int:
-    with conectar() as db:
-        cursor = db.execute(sql, parametros)
+def execute(sql: str, params: tuple[Any, ...] = ()) -> int:
+    with connect_db() as connection:
+        cursor = connection.execute(sql, params)
         return int(cursor.lastrowid or 0)
 
 
-def pesos(monto: float | int) -> str:
-    return "$" + f"{float(monto):,.0f}".replace(",", ".")
-
-
-def limites_mes(anio: int, mes: int) -> tuple[str, str]:
-    inicio = date(anio, mes, 1)
-    anio_siguiente = anio + (mes == 12)
-    mes_siguiente = 1 if mes == 12 else mes + 1
-    siguiente = date(anio_siguiente, mes_siguiente, 1)
-    return (
-        datetime.combine(inicio, time.min).isoformat(timespec="minutes"),
-        datetime.combine(siguiente, time.min).isoformat(timespec="minutes"),
+def hash_password(
+    password: str, salt: bytes | None = None
+) -> tuple[str, str]:
+    salt = salt or secrets.token_bytes(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
     )
+    return salt.hex(), password_hash.hex()
 
 
-def movimientos_del_mes(
-    perfil_id: int, inicio: str, fin: str
-) -> list[sqlite3.Row]:
-    return consultar(
+def register_account(
+    username: str, password: str
+) -> tuple[int | None, str | None]:
+    username = username.strip()
+
+    if not USERNAME_PATTERN.fullmatch(username):
+        return (
+            None,
+            "El usuario debe tener entre 3 y 30 caracteres: letras sin tilde, "
+            "números, punto, guion o guion bajo.",
+        )
+
+    if len(password) < 10:
+        return None, "La contraseña debe tener al menos 10 caracteres."
+
+    salt, password_hash = hash_password(password)
+
+    try:
+        with connect_db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            account_count = connection.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+
+            cursor = connection.execute(
+                """
+                INSERT INTO users
+                    (username, password_salt, password_hash, password_iterations)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    salt,
+                    password_hash,
+                    PASSWORD_HASH_ITERATIONS,
+                ),
+            )
+
+            user_id = int(cursor.lastrowid)
+
+            if account_count == 0:
+                # La primera cuenta recibe los perfiles de la versión anterior.
+                connection.execute(
+                    "UPDATE profiles SET user_id = ? WHERE user_id IS NULL",
+                    (user_id,),
+                )
+
+            profile_count = connection.execute(
+                "SELECT COUNT(*) FROM profiles WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()[0]
+
+            if profile_count == 0:
+                connection.execute(
+                    "INSERT INTO profiles (user_id, name) VALUES (?, ?)",
+                    (user_id, "Personal"),
+                )
+
+    except sqlite3.IntegrityError:
+        return None, "Ese nombre de usuario ya está ocupado. Elige otro."
+
+    return user_id, None
+
+
+def authenticate_user(
+    username: str, password: str
+) -> sqlite3.Row | None:
+    rows = fetch_all(
         """
-        SELECT * FROM movimientos
-        WHERE perfil_id = ? AND fecha_hora >= ? AND fecha_hora < ?
-        ORDER BY fecha_hora DESC
+        SELECT id, username, password_salt, password_hash, password_iterations
+        FROM users
+        WHERE username = ? COLLATE NOCASE
+        LIMIT 1
         """,
-        (perfil_id, inicio, fin),
+        (username.strip(),),
+    )
+
+    if not rows:
+        # Mantiene un costo similar aunque el usuario no exista.
+        hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes(16),
+            PASSWORD_HASH_ITERATIONS,
+        )
+        return None
+
+    account = rows[0]
+    candidate_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(account["password_salt"]),
+        int(account["password_iterations"]),
+    )
+
+    if hmac.compare_digest(candidate_hash.hex(), account["password_hash"]):
+        return account
+
+    return None
+
+
+def show_auth_screen() -> None:
+    st.title("Finanzas personales")
+    st.write(
+        "Inicia sesión o crea una cuenta. Cada cuenta tiene sus propios perfiles "
+        "y su información financiera."
+    )
+
+    login_tab, register_tab = st.tabs(
+        ["Iniciar sesión", "Crear cuenta"]
+    )
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Usuario", max_chars=30)
+            password = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button(
+                "Iniciar sesión", type="primary"
+            )
+
+            if submitted:
+                account = authenticate_user(username, password)
+
+                if account:
+                    st.session_state["user_id"] = int(account["id"])
+                    st.session_state["username"] = account["username"]
+                    st.rerun()
+                else:
+                    st.error("Usuario o contraseña incorrectos.")
+
+    with register_tab:
+        st.caption(
+            "El usuario admite de 3 a 30 letras sin tilde, números, punto, "
+            "guion o guion bajo. La contraseña debe tener al menos 10 caracteres."
+        )
+
+        st.info(
+            "Si ya hay datos guardados de antes, la primera cuenta que se registre "
+            "los recibirá. Crea tu cuenta antes de compartir el enlace."
+        )
+
+        with st.form("register_form"):
+            new_username = st.text_input("Elige un usuario", max_chars=30)
+            new_password = st.text_input(
+                "Elige una contraseña", type="password"
+            )
+            password_confirmation = st.text_input(
+                "Repite la contraseña", type="password"
+            )
+            submitted = st.form_submit_button(
+                "Crear cuenta", type="primary"
+            )
+
+            if submitted:
+                if new_password != password_confirmation:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    user_id, error = register_account(
+                        new_username, new_password
+                    )
+
+                    if error:
+                        st.error(error)
+                    else:
+                        st.session_state["user_id"] = user_id
+                        st.session_state["username"] = new_username.strip()
+                        st.rerun()
+
+        st.caption(
+            "Guarda tu contraseña en un lugar seguro; "
+            "no hay recuperación por correo."
+        )
+
+
+def money(amount: float | int) -> str:
+    return "$" + f"{float(amount):,.0f}".replace(",", ".")
+
+
+def next_due_date(day_of_month: int) -> date:
+    today = date.today()
+    days_this_month = calendar.monthrange(today.year, today.month)[1]
+    due_this_month = date(
+        today.year,
+        today.month,
+        min(day_of_month, days_this_month),
+    )
+
+    if due_this_month >= today:
+        return due_this_month
+
+    year = today.year + (today.month == 12)
+    month = 1 if today.month == 12 else today.month + 1
+    days_next_month = calendar.monthrange(year, month)[1]
+
+    return date(
+        year,
+        month,
+        min(day_of_month, days_next_month),
     )
 
 
-def aplicar_tema(oscuro: bool) -> None:
-    if oscuro:
-        fondo, lateral, superficie = "#101820", "#17232e", "#1d2b37"
-        texto, tenue, borde, acento = (
-            "#e7edf2", "#aab8c4", "#30414f", "#58c4a7"
+def apply_theme(dark: bool) -> None:
+    if dark:
+        background, sidebar, surface = "#101820", "#17232e", "#1d2b37"
+        text, muted, border, accent = (
+            "#e7edf2",
+            "#aab8c4",
+            "#30414f",
+            "#58c4a7",
         )
     else:
-        fondo, lateral, superficie = "#f5f8f7", "#eaf1ef", "#ffffff"
-        texto, tenue, borde, acento = (
-            "#18302b", "#60736d", "#d7e3df", "#16866b"
+        background, sidebar, surface = "#f5f8f7", "#eaf1ef", "#ffffff"
+        text, muted, border, accent = (
+            "#18302b",
+            "#60736d",
+            "#d7e3df",
+            "#16866b",
         )
 
     st.markdown(
         f"""
         <style>
         .stApp, [data-testid="stAppViewContainer"] {{
-            background: {fondo};
-            color: {texto};
+            background: {background};
+            color: {text};
         }}
         [data-testid="stSidebar"] > div:first-child {{
-            background: {lateral};
-            border-right: 1px solid {borde};
+            background: {sidebar};
+            border-right: 1px solid {border};
         }}
         [data-testid="stMetric"] {{
-            background: {superficie};
-            border: 1px solid {borde};
+            background: {surface};
+            border: 1px solid {border};
             padding: 1rem;
             border-radius: 0.8rem;
         }}
-        [data-testid="stMetricValue"], [data-testid="stMarkdownContainer"],
-        label, p, h1, h2, h3, h4 {{
-            color: {texto};
+        [data-testid="stMetricValue"], [data-testid="stHeader"],
+        [data-testid="stMarkdownContainer"], label, p, h1, h2, h3, h4 {{
+            color: {text};
         }}
         [data-testid="stCaptionContainer"] {{
-            color: {tenue};
+            color: {muted};
         }}
         div.stButton > button, div.stFormSubmitButton > button {{
-            border-color: {acento};
+            border-color: {accent};
         }}
-        hr {{ border-color: {borde}; }}
+        hr {{ border-color: {border}; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def elegir_perfil(perfiles: list[sqlite3.Row]) -> tuple[int, str]:
+def get_profile_rows(user_id: int) -> list[sqlite3.Row]:
+    return fetch_all(
+        """
+        SELECT id, name FROM profiles
+        WHERE user_id = ?
+        ORDER BY name COLLATE NOCASE
+        """,
+        (user_id,),
+    )
+
+
+def add_transaction(
+    profile_id: int,
+    kind: str,
+    description: str,
+    amount: float,
+    category: str,
+    payment_method: str,
+    occurred_at: datetime,
+) -> None:
+    execute(
+        """
+        INSERT INTO transactions
+            (profile_id, kind, description, amount, category,
+             payment_method, occurred_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            profile_id,
+            kind,
+            description.strip(),
+            amount,
+            category,
+            payment_method,
+            occurred_at.isoformat(timespec="minutes"),
+        ),
+    )
+
+
+def transactions_for_period(
+    profile_id: int, start: str, end: str
+) -> list[sqlite3.Row]:
+    return fetch_all(
+        """
+        SELECT * FROM transactions
+        WHERE profile_id = ? AND occurred_at >= ? AND occurred_at < ?
+        ORDER BY occurred_at DESC
+        """,
+        (profile_id, start, end),
+    )
+
+
+def budget_for_month(
+    profile_id: int, month_key: str
+) -> sqlite3.Row | None:
+    rows = fetch_all(
+        "SELECT * FROM budgets WHERE profile_id = ? AND month = ?",
+        (profile_id, month_key),
+    )
+    return rows[0] if rows else None
+
+
+def month_bounds(year: int, month: int) -> tuple[str, str]:
+    first = date(year, month, 1)
+    next_year = year + (month == 12)
+    next_month = 1 if month == 12 else month + 1
+    next_first = date(next_year, next_month, 1)
+
+    return (
+        datetime.combine(first, time.min).isoformat(timespec="minutes"),
+        datetime.combine(next_first, time.min).isoformat(timespec="minutes"),
+    )
+
+
+def show_transactions(
+    profile_id: int, rows: list[sqlite3.Row]
+) -> None:
+    if not rows:
+        st.info("Todavía no hay movimientos para este periodo.")
+        return
+
+    table = pd.DataFrame(
+        [
+            {
+                "Fecha y hora": datetime.fromisoformat(
+                    row["occurred_at"]
+                ).strftime("%d/%m/%Y %H:%M"),
+                "Tipo": row["kind"],
+                "Descripción": row["description"],
+                "Categoría": row["category"],
+                "Método": row["payment_method"],
+                "Monto": money(row["amount"]),
+                "id": row["id"],
+            }
+            for row in rows
+        ]
+    )
+
+    st.dataframe(
+        table.drop(columns=["id"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    delete_options = {
+        f'{datetime.fromisoformat(row["occurred_at"]).strftime("%d/%m/%Y %H:%M")} · '
+        f'{row["description"]} · {money(row["amount"])}': row["id"]
+        for row in rows
+    }
+
+    with st.expander("Eliminar un movimiento"):
+        selected_label = st.selectbox(
+            "Movimiento",
+            list(delete_options),
+            key=f"delete_transaction_{profile_id}",
+        )
+
+        if st.button(
+            "Eliminar movimiento",
+            key=f"delete_transaction_button_{profile_id}",
+            type="secondary",
+        ):
+            execute(
+                "DELETE FROM transactions WHERE id = ? AND profile_id = ?",
+                (delete_options[selected_label], profile_id),
+            )
+            st.success("Movimiento eliminado.")
+            st.rerun()
+
+
+def export_everything(user_id: int) -> bytes:
+    profiles = {
+        row["id"]: row["name"]
+        for row in get_profile_rows(user_id)
+    }
+    profile_ids = list(profiles)
+
+    if not profile_ids:
+        records = [{"tipo_registro": "sin_datos", "perfil": ""}]
+        frame = pd.DataFrame(records)
+        buffer = io.StringIO()
+        frame.to_csv(buffer, index=False, quoting=csv.QUOTE_MINIMAL)
+        return buffer.getvalue().encode("utf-8-sig")
+
+    placeholders = ", ".join("?" for _ in profile_ids)
+
+    tables = {
+        "movimientos": (
+            f"SELECT * FROM transactions "
+            f"WHERE profile_id IN ({placeholders}) ORDER BY occurred_at"
+        ),
+        "presupuestos": (
+            f"SELECT * FROM budgets "
+            f"WHERE profile_id IN ({placeholders}) ORDER BY month"
+        ),
+        "obligaciones": (
+            f"SELECT * FROM obligations "
+            f"WHERE profile_id IN ({placeholders}) ORDER BY due_day"
+        ),
+        "deudas": (
+            f"SELECT * FROM debts "
+            f"WHERE profile_id IN ({placeholders}) ORDER BY creditor"
+        ),
+        "metas": (
+            f"SELECT * FROM goals "
+            f"WHERE profile_id IN ({placeholders}) ORDER BY name"
+        ),
+    }
+
+    records: list[dict[str, Any]] = []
+
+    for table_name, sql in tables.items():
+        for row in fetch_all(sql, tuple(profile_ids)):
+            record = dict(row)
+            profile_id = record.get("profile_id")
+            records.append(
+                {
+                    "tipo_registro": table_name,
+                    "perfil": profiles.get(profile_id, ""),
+                    **record,
+                }
+            )
+
+    for profile_id, profile_name in profiles.items():
+        records.append(
+            {
+                "tipo_registro": "perfil",
+                "perfil": profile_name,
+                "id": profile_id,
+                "name": profile_name,
+            }
+        )
+
+    if not records:
+        records = [{"tipo_registro": "sin_datos", "perfil": ""}]
+
+    frame = pd.DataFrame(records).fillna("")
+    buffer = io.StringIO()
+    frame.to_csv(buffer, index=False, quoting=csv.QUOTE_MINIMAL)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def sidebar(
+    profile_rows: list[sqlite3.Row],
+    user_id: int,
+    username: str,
+) -> tuple[int, str]:
     with st.sidebar:
-        st.title("Finanzas personales")
-        nombres = [p["nombre"] for p in perfiles]
-        ids = {p["nombre"]: p["id"] for p in perfiles}
-        seleccionado = st.selectbox("Perfil", nombres)
-        st.toggle("Modo oscuro", key="modo_oscuro", value=False)
+        st.title("Finanzas")
+        st.caption("Tu espacio para organizar el dinero.")
+        st.caption(f"Sesión: {username}")
+
+        if st.button("Cerrar sesión", use_container_width=True):
+            st.session_state.pop("user_id", None)
+            st.session_state.pop("username", None)
+            st.rerun()
+
+        profile_names = [row["name"] for row in profile_rows]
+        profile_ids = {row["name"]: row["id"] for row in profile_rows}
+
+        selected_name = st.selectbox(
+            "Perfil",
+            profile_names,
+            key=f"profile_select_{user_id}",
+        )
+
+        st.session_state.setdefault("dark_mode", False)
+        st.toggle("Modo oscuro", key="dark_mode")
 
         with st.expander("Crear perfil"):
-            with st.form("formulario_perfil", clear_on_submit=True):
-                nombre = st.text_input("Nombre del perfil", max_chars=50)
-                guardar = st.form_submit_button("Crear perfil")
-                if guardar:
-                    nombre = nombre.strip()
-                    if not nombre:
+            with st.form("create_profile_form", clear_on_submit=True):
+                new_profile = st.text_input(
+                    "Nombre del perfil",
+                    max_chars=50,
+                )
+                submitted = st.form_submit_button("Crear perfil")
+
+                if submitted:
+                    cleaned = new_profile.strip()
+
+                    if not cleaned:
                         st.error("Escribe un nombre para el perfil.")
                     else:
                         try:
-                            ejecutar(
-                                "INSERT INTO perfiles (nombre) VALUES (?)",
-                                (nombre,),
+                            execute(
+                                "INSERT INTO profiles (user_id, name) "
+                                "VALUES (?, ?)",
+                                (user_id, cleaned),
                             )
+                            st.success("Perfil creado.")
                             st.rerun()
                         except sqlite3.IntegrityError:
-                            st.error("Ya existe un perfil con ese nombre.")
+                            st.error("Ya tienes un perfil con ese nombre.")
 
         st.divider()
-        st.caption("Los datos se guardan en una base SQLite de este proyecto.")
-        return int(ids[seleccionado]), seleccionado
+        st.caption("Tus perfiles y datos son privados de esta cuenta.")
+
+        return int(profile_ids[selected_name]), selected_name
 
 
-def mostrar_inicio(perfil_id: int, perfil: str) -> None:
-    hoy = date.today()
-    inicio, fin = limites_mes(hoy.year, hoy.month)
-    filas = movimientos_del_mes(perfil_id, inicio, fin)
+def show_overview(profile_id: int, profile_name: str) -> None:
+    today = date.today()
+    start, end = month_bounds(today.year, today.month)
+    rows = transactions_for_period(profile_id, start, end)
 
-    ingresos = sum(f["monto"] for f in filas if f["tipo"] == "Ingreso")
-    gastos = sum(f["monto"] for f in filas if f["tipo"] == "Gasto")
-
-    presupuesto = consultar(
-        "SELECT ingresos_proyectados FROM presupuestos "
-        "WHERE perfil_id = ? AND mes = ?",
-        (perfil_id, hoy.strftime("%Y-%m")),
+    income = sum(
+        row["amount"] for row in rows if row["kind"] == "Ingreso"
     )
-    proyectado = presupuesto[0]["ingresos_proyectados"] if presupuesto else 0
+    expenses = sum(
+        row["amount"] for row in rows if row["kind"] == "Gasto"
+    )
 
-    obligaciones = consultar(
-        "SELECT COALESCE(SUM(monto), 0) AS total FROM obligaciones "
-        "WHERE perfil_id = ?",
-        (perfil_id,),
+    month_key = today.strftime("%Y-%m")
+    budget = budget_for_month(profile_id, month_key)
+
+    obligations = fetch_all(
+        "SELECT COALESCE(SUM(amount), 0) AS total "
+        "FROM obligations WHERE profile_id = ?",
+        (profile_id,),
     )[0]["total"]
 
-    st.title(f"Hola, {perfil}")
-    st.caption(f"Resumen de {MESES[hoy.month - 1]} {hoy.year}")
+    projected_income = budget["projected_income"] if budget else 0
+    planned_margin = projected_income - obligations
+
+    st.title(f"Hola, {profile_name}")
+    st.caption(f"Resumen de {MONTHS[today.month - 1]} {today.year}")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ingresos del mes", pesos(ingresos))
-    c2.metric("Gastos del mes", pesos(gastos))
-    c3.metric("Balance registrado", pesos(ingresos - gastos))
-    c4.metric("Margen tras obligaciones", pesos(proyectado - obligaciones))
+    c1.metric("Ingresos del mes", money(income))
+    c2.metric("Gastos del mes", money(expenses))
+    c3.metric("Balance registrado", money(income - expenses))
+    c4.metric("Margen tras obligaciones", money(planned_margin))
 
     st.subheader("Actividad reciente")
-    recientes = consultar(
-        "SELECT * FROM movimientos WHERE perfil_id = ? "
-        "ORDER BY fecha_hora DESC LIMIT 6",
-        (perfil_id,),
+    recent = fetch_all(
+        """
+        SELECT * FROM transactions
+        WHERE profile_id = ?
+        ORDER BY occurred_at DESC LIMIT 6
+        """,
+        (profile_id,),
     )
-    if recientes:
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Fecha": datetime.fromisoformat(
-                            r["fecha_hora"]
-                        ).strftime("%d/%m/%Y %H:%M"),
-                        "Descripción": r["descripcion"],
-                        "Tipo": r["tipo"],
-                        "Categoría": r["categoria"],
-                        "Monto": pesos(r["monto"]),
-                    }
-                    for r in recientes
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
+
+    if recent:
+        frame = pd.DataFrame(
+            [
+                {
+                    "Fecha": datetime.fromisoformat(
+                        row["occurred_at"]
+                    ).strftime("%d/%m/%Y"),
+                    "Descripción": row["description"],
+                    "Tipo": row["kind"],
+                    "Categoría": row["category"],
+                    "Monto": money(row["amount"]),
+                }
+                for row in recent
+            ]
         )
+        st.dataframe(frame, use_container_width=True, hide_index=True)
     else:
-        st.info("Registra tu primer ingreso o gasto para empezar.")
+        st.info(
+            "Registra tu primer ingreso o gasto para empezar a ver "
+            "tu actividad aquí."
+        )
 
     st.caption(
         "El margen resta las obligaciones fijas del ingreso proyectado. "
-        "El balance usa únicamente movimientos guardados."
+        "El balance registrado usa únicamente movimientos guardados."
     )
 
 
-def mostrar_movimientos(perfil_id: int) -> None:
+def show_movements(profile_id: int) -> None:
     st.title("Movimientos")
-    st.caption("Registra ingresos y gastos con fecha, hora y método de pago.")
+    st.caption(
+        "Registra ingresos y gastos con su fecha, hora y método de pago."
+    )
 
-    with st.form("formulario_movimiento", clear_on_submit=True):
-        tipo = st.selectbox("Tipo de movimiento", ["Gasto", "Ingreso"])
-        descripcion = st.text_input("Nombre o descripción", max_chars=120)
-        c1, c2 = st.columns(2)
-        monto = c1.number_input(
-            "Monto (COP)", min_value=0.0, step=1000.0, format="%.0f"
+    with st.form(
+        f"movement_form_{profile_id}",
+        clear_on_submit=True,
+    ):
+        kind = st.selectbox(
+            "Tipo de movimiento",
+            ["Gasto", "Ingreso"],
         )
-        fecha = c2.date_input("Fecha", value=date.today())
-        c3, c4 = st.columns(2)
-        hora = c3.time_input(
+        description = st.text_input(
+            "Nombre o descripción",
+            max_chars=120,
+        )
+
+        first, second = st.columns(2)
+
+        amount = first.number_input(
+            "Monto (COP)",
+            min_value=0.0,
+            step=1000.0,
+            format="%.0f",
+        )
+        occurred_date = second.date_input(
+            "Fecha",
+            value=date.today(),
+        )
+
+        third, fourth = st.columns(2)
+
+        occurred_time = third.time_input(
             "Hora",
-            value=datetime.now().time().replace(second=0, microsecond=0),
+            value=datetime.now().time().replace(
+                second=0,
+                microsecond=0,
+            ),
         )
-        metodo = c4.selectbox("Método de pago", METODOS)
-        opciones = GASTOS if tipo == "Gasto" else INGRESOS
-        categoria = st.selectbox("Categoría", opciones)
-        guardar = st.form_submit_button("Guardar movimiento", type="primary")
+        payment_method = fourth.selectbox(
+            "Método de pago",
+            PAYMENT_METHODS,
+        )
 
-        if guardar:
-            if not descripcion.strip():
+        category_options = (
+            EXPENSE_CATEGORIES
+            if kind == "Gasto"
+            else INCOME_CATEGORIES
+        )
+        category = st.selectbox(
+            "Categoría",
+            category_options,
+        )
+
+        submitted = st.form_submit_button(
+            "Guardar movimiento",
+            type="primary",
+        )
+
+        if submitted:
+            if not description.strip():
                 st.error("Escribe una descripción.")
-            elif monto <= 0:
+            elif amount <= 0:
                 st.error("El monto debe ser mayor que cero.")
             else:
-                ejecutar(
-                    """
-                    INSERT INTO movimientos
-                        (perfil_id, tipo, descripcion, monto, categoria,
-                         metodo_pago, fecha_hora)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        perfil_id,
-                        tipo,
-                        descripcion.strip(),
-                        monto,
-                        categoria,
-                        metodo,
-                        datetime.combine(fecha, hora).isoformat(
-                            timespec="minutes"
-                        ),
-                    ),
+                add_transaction(
+                    profile_id,
+                    kind,
+                    description,
+                    amount,
+                    category,
+                    payment_method,
+                    datetime.combine(occurred_date, occurred_time),
                 )
                 st.success("Movimiento guardado.")
                 st.rerun()
 
     st.divider()
     st.subheader("Historial")
-    hoy = date.today()
-    c1, c2 = st.columns(2)
-    anio = c1.selectbox(
+
+    current_year = date.today().year
+    years = list(range(current_year, current_year - 8, -1))
+
+    f1, f2 = st.columns(2)
+
+    selected_year = f1.selectbox(
         "Año",
-        list(range(hoy.year, hoy.year - 8, -1)),
-        key="anio_movimientos",
+        years,
+        key=f"movement_year_{profile_id}",
     )
-    mes = c2.selectbox(
+    selected_month = f2.selectbox(
         "Mes",
         list(range(1, 13)),
-        index=hoy.month - 1,
-        format_func=lambda m: MESES[m - 1],
-        key="mes_movimientos",
+        index=date.today().month - 1,
+        format_func=lambda month: MONTHS[month - 1],
+        key=f"movement_month_{profile_id}",
     )
 
-    inicio, fin = limites_mes(anio, mes)
-    filas = movimientos_del_mes(perfil_id, inicio, fin)
-
-    if not filas:
-        st.info("No hay movimientos en ese periodo.")
-        return
-
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "Fecha y hora": datetime.fromisoformat(
-                        r["fecha_hora"]
-                    ).strftime("%d/%m/%Y %H:%M"),
-                    "Tipo": r["tipo"],
-                    "Descripción": r["descripcion"],
-                    "Categoría": r["categoria"],
-                    "Método": r["metodo_pago"],
-                    "Monto": pesos(r["monto"]),
-                }
-                for r in filas
-            ]
-        ),
-        use_container_width=True,
-        hide_index=True,
+    start, end = month_bounds(selected_year, selected_month)
+    show_transactions(
+        profile_id,
+        transactions_for_period(profile_id, start, end),
     )
 
-    opciones_borrar = {
-        f'{r["descripcion"]} · {pesos(r["monto"])} · '
-        f'{datetime.fromisoformat(r["fecha_hora"]).strftime("%d/%m/%Y")}': r["id"]
-        for r in filas
-    }
-    with st.expander("Eliminar un movimiento"):
-        elegido = st.selectbox("Movimiento", list(opciones_borrar))
-        if st.button("Eliminar movimiento"):
-            ejecutar(
-                "DELETE FROM movimientos WHERE id = ? AND perfil_id = ?",
-                (opciones_borrar[elegido], perfil_id),
-            )
-            st.rerun()
 
-
-def mostrar_presupuesto(perfil_id: int) -> None:
+def show_budget(profile_id: int) -> None:
     st.title("Presupuesto mensual")
-    hoy = date.today()
-    c1, c2 = st.columns(2)
-    anio = c1.selectbox(
+    today = date.today()
+
+    year = st.selectbox(
         "Año",
-        list(range(hoy.year, hoy.year - 8, -1)),
-        key="anio_presupuesto",
+        list(range(today.year, today.year - 8, -1)),
+        key=f"budget_year_{profile_id}",
     )
-    mes = c2.selectbox(
+    month = st.selectbox(
         "Mes",
         list(range(1, 13)),
-        index=hoy.month - 1,
-        format_func=lambda m: MESES[m - 1],
-        key="mes_presupuesto",
+        index=today.month - 1,
+        format_func=lambda value: MONTHS[value - 1],
+        key=f"budget_month_{profile_id}",
     )
-    mes_clave = f"{anio:04d}-{mes:02d}"
 
-    fila = consultar(
-        "SELECT ingresos_proyectados FROM presupuestos "
-        "WHERE perfil_id = ? AND mes = ?",
-        (perfil_id, mes_clave),
+    month_key = f"{year:04d}-{month:02d}"
+    current_budget = budget_for_month(profile_id, month_key)
+    projected_default = (
+        float(current_budget["projected_income"])
+        if current_budget
+        else 0.0
     )
-    proyectado_actual = float(fila[0]["ingresos_proyectados"]) if fila else 0.0
 
     st.subheader("Ingresos proyectados")
-    with st.form("formulario_presupuesto"):
-        proyectado = st.number_input(
+
+    with st.form(f"budget_form_{profile_id}_{month_key}"):
+        projected = st.number_input(
             "Ingreso esperado del mes (COP)",
             min_value=0.0,
-            value=proyectado_actual,
+            value=projected_default,
             step=10000.0,
             format="%.0f",
         )
-        guardar = st.form_submit_button("Guardar proyección")
-        if guardar:
-            ejecutar(
+        submitted = st.form_submit_button("Guardar proyección")
+
+        if submitted:
+            execute(
                 """
-                INSERT INTO presupuestos (perfil_id, mes, ingresos_proyectados)
+                INSERT INTO budgets (profile_id, month, projected_income)
                 VALUES (?, ?, ?)
-                ON CONFLICT(perfil_id, mes)
-                DO UPDATE SET ingresos_proyectados = excluded.ingresos_proyectados
+                ON CONFLICT(profile_id, month)
+                DO UPDATE SET projected_income = excluded.projected_income
                 """,
-                (perfil_id, mes_clave, proyectado),
+                (profile_id, month_key, projected),
             )
+            st.success("Proyección guardada.")
             st.rerun()
 
     st.subheader("Obligaciones fijas")
-    with st.form("formulario_obligacion", clear_on_submit=True):
-        nombre = st.text_input("Obligación, por ejemplo arriendo o servicios")
-        monto = st.number_input(
-            "Valor mensual (COP)", min_value=0.0, step=10000.0, format="%.0f"
+
+    with st.form(
+        f"obligation_form_{profile_id}",
+        clear_on_submit=True,
+    ):
+        name = st.text_input(
+            "Obligación (por ejemplo, arriendo o servicios)"
         )
-        dia = st.number_input("Día límite de pago", min_value=1, max_value=31, value=1)
-        guardar = st.form_submit_button("Agregar obligación")
-        if guardar:
-            if not nombre.strip() or monto <= 0:
-                st.error("Escribe el nombre y un valor mayor que cero.")
+        amount = st.number_input(
+            "Valor mensual (COP)",
+            min_value=0.0,
+            step=10000.0,
+            format="%.0f",
+        )
+        due_day = st.number_input(
+            "Día límite de pago",
+            min_value=1,
+            max_value=31,
+            value=1,
+        )
+        submitted = st.form_submit_button("Agregar obligación")
+
+        if submitted:
+            if not name.strip():
+                st.error("Escribe el nombre de la obligación.")
+            elif amount <= 0:
+                st.error("El valor debe ser mayor que cero.")
             else:
-                ejecutar(
-                    "INSERT INTO obligaciones "
-                    "(perfil_id, nombre, monto, dia_limite) VALUES (?, ?, ?, ?)",
-                    (perfil_id, nombre.strip(), monto, int(dia)),
+                execute(
+                    "INSERT INTO obligations "
+                    "(profile_id, name, amount, due_day) "
+                    "VALUES (?, ?, ?, ?)",
+                    (profile_id, name.strip(), amount, int(due_day)),
                 )
+                st.success("Obligación agregada.")
                 st.rerun()
 
-    obligaciones = consultar(
-        "SELECT * FROM obligaciones WHERE perfil_id = ? ORDER BY dia_limite",
-        (perfil_id,),
+    obligations = fetch_all(
+        "SELECT * FROM obligations "
+        "WHERE profile_id = ? ORDER BY due_day, name",
+        (profile_id,),
     )
-    total = sum(o["monto"] for o in obligaciones)
+
+    total_obligations = sum(row["amount"] for row in obligations)
+    planned_margin = projected_default - total_obligations
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Ingreso proyectado", pesos(proyectado_actual))
-    c2.metric("Obligaciones mensuales", pesos(total))
-    c3.metric("Margen planificado", pesos(proyectado_actual - total))
+    c1.metric("Ingreso proyectado", money(projected_default))
+    c2.metric("Obligaciones mensuales", money(total_obligations))
+    c3.metric("Margen planificado", money(planned_margin))
 
-    if obligaciones:
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Obligación": o["nombre"],
-                        "Valor": pesos(o["monto"]),
-                        "Fecha límite": f"Día {o['dia_limite']}",
-                    }
-                    for o in obligaciones
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
+    if obligations:
+        frame = pd.DataFrame(
+            [
+                {
+                    "Obligación": row["name"],
+                    "Valor": money(row["amount"]),
+                    "Fecha límite": f"Día {row['due_day']}",
+                }
+                for row in obligations
+            ]
         )
-        nombres = {
-            f"{o['nombre']} · {pesos(o['monto'])}": o["id"]
-            for o in obligaciones
-        }
-        elegido = st.selectbox("Eliminar obligación", list(nombres))
-        if st.button("Eliminar obligación"):
-            ejecutar(
-                "DELETE FROM obligaciones WHERE id = ? AND perfil_id = ?",
-                (nombres[elegido], perfil_id),
+        st.dataframe(frame, use_container_width=True, hide_index=True)
+
+        with st.expander("Eliminar una obligación"):
+            choice = st.selectbox(
+                "Obligación",
+                {
+                    f"{row['name']} · {money(row['amount'])}": row["id"]
+                    for row in obligations
+                },
+                key=f"delete_obligation_{profile_id}",
             )
-            st.rerun()
+
+            if st.button(
+                "Eliminar obligación",
+                key=f"delete_obligation_btn_{profile_id}",
+            ):
+                execute(
+                    "DELETE FROM obligations "
+                    "WHERE id = ? AND profile_id = ?",
+                    (choice, profile_id),
+                )
+                st.success("Obligación eliminada.")
+                st.rerun()
     else:
-        st.info("Agrega pagos fijos para calcular el margen planificado.")
+        st.info(
+            "Agrega tus pagos fijos para calcular el margen planificado."
+        )
 
     st.caption(
-        "El margen es el ingreso proyectado menos las obligaciones fijas. "
-        "Los gastos registrados se muestran por separado para evitar duplicarlos."
+        "El margen planificado es ingreso proyectado menos obligaciones fijas. "
+        "Los gastos registrados se muestran por separado para evitar contar "
+        "dos veces un pago que también figure como obligación."
     )
 
 
-def fecha_vencimiento(dia: int) -> date:
-    hoy = date.today()
-    ultimo = calendar.monthrange(hoy.year, hoy.month)[1]
-    vencimiento = date(hoy.year, hoy.month, min(dia, ultimo))
-    if vencimiento >= hoy:
-        return vencimiento
-    anio = hoy.year + (hoy.month == 12)
-    mes = 1 if hoy.month == 12 else hoy.month + 1
-    ultimo = calendar.monthrange(anio, mes)[1]
-    return date(anio, mes, min(dia, ultimo))
-
-
-def mostrar_deudas(perfil_id: int) -> None:
+def show_debts(profile_id: int) -> None:
     st.title("Deudas")
 
-    with st.form("formulario_deuda", clear_on_submit=True):
-        acreedor = st.text_input("Acreedor o banco")
-        deuda_total = st.number_input(
-            "Deuda total (COP)", min_value=0.0, step=10000.0, format="%.0f"
-        )
-        saldo = st.number_input(
-            "Saldo pendiente actual (COP)", min_value=0.0, step=10000.0,
-            format="%.0f"
-        )
-        tasa = st.number_input(
-            "Tasa de interés anual (%)", min_value=0.0, step=0.1, format="%.2f"
-        )
-        c1, c2 = st.columns(2)
-        cuotas_totales = c1.number_input(
-            "Número total de cuotas", min_value=1, value=1, step=1
-        )
-        cuotas_pendientes = c2.number_input(
-            "Cuotas faltantes", min_value=0, value=1, step=1
-        )
-        c3, c4 = st.columns(2)
-        cuota = c3.number_input(
-            "Valor mensual (COP)", min_value=0.0, step=10000.0, format="%.0f"
-        )
-        dia = c4.number_input(
-            "Día límite de pago", min_value=1, max_value=31, value=1
-        )
-        guardar = st.form_submit_button("Guardar deuda", type="primary")
+    with st.form(
+        f"debt_form_{profile_id}",
+        clear_on_submit=True,
+    ):
+        creditor = st.text_input("Acreedor o banco")
 
-        if guardar:
-            if not acreedor.strip():
+        total_amount = st.number_input(
+            "Deuda total (COP)",
+            min_value=0.0,
+            step=10000.0,
+            format="%.0f",
+        )
+        remaining = st.number_input(
+            "Saldo pendiente actual (COP)",
+            min_value=0.0,
+            step=10000.0,
+            format="%.0f",
+        )
+        interest = st.number_input(
+            "Tasa de interés anual (%)",
+            min_value=0.0,
+            step=0.1,
+            format="%.2f",
+        )
+
+        c1, c2 = st.columns(2)
+        total_installments = c1.number_input(
+            "Número total de cuotas",
+            min_value=1,
+            value=1,
+            step=1,
+        )
+        installments_left = c2.number_input(
+            "Cuotas faltantes",
+            min_value=0,
+            value=1,
+            step=1,
+        )
+
+        c3, c4 = st.columns(2)
+        monthly_payment = c3.number_input(
+            "Valor mensual (COP)",
+            min_value=0.0,
+            step=10000.0,
+            format="%.0f",
+        )
+        due_day = c4.number_input(
+            "Día límite de pago",
+            min_value=1,
+            max_value=31,
+            value=1,
+        )
+
+        submitted = st.form_submit_button(
+            "Guardar deuda",
+            type="primary",
+        )
+
+        if submitted:
+            if not creditor.strip():
                 st.error("Escribe el nombre del acreedor o banco.")
-            elif deuda_total <= 0 or cuota <= 0 or saldo > deuda_total:
-                st.error("Revisa los valores de la deuda y la cuota mensual.")
-            elif cuotas_pendientes > cuotas_totales:
-                st.error("Las cuotas faltantes no pueden superar el total.")
+            elif total_amount <= 0 or monthly_payment <= 0:
+                st.error(
+                    "La deuda total y el valor mensual deben ser mayores que cero."
+                )
+            elif remaining > total_amount:
+                st.error(
+                    "El saldo pendiente no puede superar la deuda total."
+                )
+            elif installments_left > total_installments:
+                st.error(
+                    "Las cuotas faltantes no pueden superar el total de cuotas."
+                )
             else:
-                ejecutar(
+                execute(
                     """
-                    INSERT INTO deudas
-                        (perfil_id, acreedor, deuda_total, saldo_pendiente,
-                         tasa_interes, cuotas_totales, cuotas_pendientes,
-                         cuota_mensual, dia_limite)
+                    INSERT INTO debts
+                        (profile_id, creditor, total_amount, remaining_balance,
+                         interest_rate, total_installments, installments_left,
+                         monthly_payment, due_day)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        perfil_id, acreedor.strip(), deuda_total, saldo, tasa,
-                        int(cuotas_totales), int(cuotas_pendientes), cuota, int(dia),
+                        profile_id,
+                        creditor.strip(),
+                        total_amount,
+                        remaining,
+                        interest,
+                        int(total_installments),
+                        int(installments_left),
+                        monthly_payment,
+                        int(due_day),
                     ),
                 )
+                st.success("Deuda guardada.")
                 st.rerun()
 
-    deudas = consultar(
-        "SELECT * FROM deudas WHERE perfil_id = ? ORDER BY dia_limite",
-        (perfil_id,),
+    debts = fetch_all(
+        "SELECT * FROM debts "
+        "WHERE profile_id = ? ORDER BY due_day, creditor",
+        (profile_id,),
     )
-    if not deudas:
+
+    if not debts:
         st.info("Todavía no has agregado deudas.")
         return
 
     st.subheader("Resumen de deudas")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "Acreedor": d["acreedor"],
-                    "Saldo pendiente": pesos(d["saldo_pendiente"]),
-                    "Tasa anual": f"{d['tasa_interes']:.2f}%",
-                    "Cuotas": f"{d['cuotas_pendientes']} de {d['cuotas_totales']}",
-                    "Cuota mensual": pesos(d["cuota_mensual"]),
-                    "Próximo vencimiento": fecha_vencimiento(
-                        d["dia_limite"]
-                    ).strftime("%d/%m/%Y"),
-                }
-                for d in deudas
-            ]
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
 
-    activas = [d for d in deudas if d["saldo_pendiente"] > 0]
-    if activas:
-        opciones = {
-            f'{d["acreedor"]} · saldo {pesos(d["saldo_pendiente"])}': d
-            for d in activas
-        }
-        with st.form("formulario_pago_deuda"):
-            etiqueta = st.selectbox("Deuda", list(opciones))
-            deuda = opciones[etiqueta]
-            pago = st.number_input(
-                "Monto pagado (COP)",
-                min_value=0.0,
-                max_value=float(deuda["saldo_pendiente"]),
-                step=10000.0,
-                format="%.0f",
-            )
-            metodo = st.selectbox("Método de pago", METODOS)
-            guardar = st.form_submit_button("Registrar pago")
-
-            if guardar:
-                if pago <= 0:
-                    st.error("El pago debe ser mayor que cero.")
-                else:
-                    nuevo_saldo = max(0.0, deuda["saldo_pendiente"] - pago)
-                    cuotas_pagadas = int(pago // deuda["cuota_mensual"])
-                    faltantes = (
-                        0 if nuevo_saldo == 0
-                        else max(0, deuda["cuotas_pendientes"] - cuotas_pagadas)
-                    )
-                    with conectar() as db:
-                        db.execute(
-                            "UPDATE deudas SET saldo_pendiente = ?, "
-                            "cuotas_pendientes = ? WHERE id = ?",
-                            (nuevo_saldo, faltantes, deuda["id"]),
-                        )
-                        db.execute(
-                            """
-                            INSERT INTO movimientos
-                                (perfil_id, tipo, descripcion, monto, categoria,
-                                 metodo_pago, fecha_hora)
-                            VALUES (?, 'Gasto', ?, ?, 'Deudas', ?, ?)
-                            """,
-                            (
-                                perfil_id,
-                                f"Abono a deuda: {deuda['acreedor']}",
-                                pago,
-                                metodo,
-                                datetime.now().isoformat(timespec="minutes"),
-                            ),
-                        )
-                    st.rerun()
-
-
-def mostrar_metas(perfil_id: int) -> None:
-    st.title("Metas de ahorro")
-
-    with st.form("formulario_meta", clear_on_submit=True):
-        nombre = st.text_input("Nombre de la meta")
-        objetivo = st.number_input(
-            "Monto objetivo (COP)", min_value=0.0, step=10000.0, format="%.0f"
-        )
-        ahorrado = st.number_input(
-            "Ahorro actual (COP)", min_value=0.0, step=10000.0, format="%.0f"
-        )
-        fecha = st.date_input("Fecha objetivo (opcional)", value=None)
-        guardar = st.form_submit_button("Crear meta")
-
-        if guardar:
-            if not nombre.strip() or objetivo <= 0 or ahorrado > objetivo:
-                st.error("Revisa el nombre y los montos de la meta.")
-            else:
-                ejecutar(
-                    """
-                    INSERT INTO metas
-                        (perfil_id, nombre, monto_objetivo, monto_ahorrado,
-                         fecha_objetivo)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        perfil_id, nombre.strip(), objetivo, ahorrado,
-                        fecha.isoformat() if fecha else None,
-                    ),
-                )
-                st.rerun()
-
-    metas = consultar(
-        "SELECT * FROM metas WHERE perfil_id = ? ORDER BY nombre",
-        (perfil_id,),
-    )
-    if not metas:
-        st.info("Crea una meta para empezar a seguir tu ahorro.")
-        return
-
-    for meta in metas:
-        objetivo = float(meta["monto_objetivo"])
-        ahorrado = float(meta["monto_ahorrado"])
-        progreso = min(ahorrado / objetivo, 1.0)
-
-        st.subheader(meta["nombre"])
-        st.progress(
-            progreso,
-            text=f"{progreso:.0%} · {pesos(ahorrado)} de {pesos(objetivo)}",
-        )
-        if meta["fecha_objetivo"]:
-            st.caption(
-                "Fecha objetivo: "
-                + date.fromisoformat(meta["fecha_objetivo"]).strftime("%d/%m/%Y")
-            )
-
-        with st.form(f"aporte_meta_{meta['id']}"):
-            aporte = st.number_input(
-                "Agregar ahorro (COP)",
-                min_value=0.0,
-                max_value=max(0.0, objetivo - ahorrado),
-                step=10000.0,
-                format="%.0f",
-                key=f"aporte_{meta['id']}",
-            )
-            col_1, col_2 = st.columns(2)
-            sumar = col_1.form_submit_button("Sumar ahorro")
-            eliminar = col_2.form_submit_button("Eliminar meta")
-
-            if sumar and aporte > 0:
-                ejecutar(
-                    "UPDATE metas SET monto_ahorrado = monto_ahorrado + ? "
-                    "WHERE id = ? AND perfil_id = ?",
-                    (aporte, meta["id"], perfil_id),
-                )
-                st.rerun()
-            
-            if eliminar:
-                ejecutar(
-                    "DELETE FROM metas WHERE id = ? AND perfil_id = ?",
-                    (meta["id"], perfil_id),
-                )
-                st.rerun()
-
-
-def exportar_csv() -> bytes:
-    nombres = {
-        p["id"]: p["nombre"]
-        for p in consultar("SELECT id, nombre FROM perfiles")
-    }
-
-    tablas = {
-        "movimiento": "SELECT * FROM movimientos",
-        "presupuesto": "SELECT * FROM presupuestos",
-        "obligacion": "SELECT * FROM obligaciones",
-        "deuda": "SELECT * FROM deudas",
-        "meta": "SELECT * FROM metas",
-    }
-
-    filas: list[dict[str, Any]] = []
-
-    for tipo, sql in tablas.items():
-        for row in consultar(sql):
-            registro = dict(row)
-            perfil_id = registro.get("perfil_id")
-            filas.append(
-                {
-                    "tipo_registro": tipo,
-                    "perfil": nombres.get(perfil_id, ""),
-                    **registro,
-                }
-            )
-
-    for perfil_id, nombre in nombres.items():
-        filas.append(
-            {
-                "tipo_registro": "perfil",
-                "perfil": nombre,
-                "id": perfil_id,
-                "nombre": nombre,
-            }
-        )
-
-    if not filas:
-        filas = [{"tipo_registro": "sin_datos", "perfil": ""}]
-
-    traducciones = {
-        "perfil_id": "id_perfil",
-        "tipo": "tipo_movimiento",
-        "descripcion": "descripcion",
-        "monto": "monto",
-        "categoria": "categoria",
-        "metodo_pago": "metodo_pago",
-        "fecha_hora": "fecha_hora",
-        "mes": "mes",
-        "ingresos_proyectados": "ingresos_proyectados",
-        "dia_limite": "dia_limite",
-        "acreedor": "acreedor",
-        "deuda_total": "deuda_total",
-        "saldo_pendiente": "saldo_pendiente",
-        "tasa_interes": "tasa_interes",
-        "cuotas_totales": "cuotas_totales",
-        "cuotas_pendientes": "cuotas_pendientes",
-        "cuota_mensual": "cuota_mensual",
-        "monto_objetivo": "monto_objetivo",
-        "monto_ahorrado": "monto_ahorrado",
-        "fecha_objetivo": "fecha_objetivo",
-    }
-
-    tabla = pd.DataFrame(filas).fillna("")
-    tabla = tabla.rename(columns=traducciones)
-    buffer = io.StringIO()
-    tabla.to_csv(buffer, index=False, quoting=csv.QUOTE_MINIMAL)
-
-    return buffer.getvalue().encode("utf-8-sig")
-
-
-def mostrar_reportes(perfil_id: int) -> None:
-    st.title("Reportes")
-    hoy = date.today()
-
-    anio = st.selectbox(
-        "Año de análisis",
-        list(range(hoy.year, hoy.year - 8, -1)),
-        key="anio_reportes",
-    )
-    mes = st.selectbox(
-        "Mes para el desglose",
-        list(range(1, 13)),
-        index=hoy.month - 1,
-        format_func=lambda m: MESES[m - 1],
-        key="mes_reportes",
-    )
-
-    filas_anio = consultar(
-        """
-        SELECT * FROM movimientos
-        WHERE perfil_id = ? AND fecha_hora >= ? AND fecha_hora < ?
-        ORDER BY fecha_hora
-        """,
-        (perfil_id, f"{anio}-01-01T00:00", f"{anio + 1}-01-01T00:00"),
-    )
-
-    inicio, fin = limites_mes(anio, mes)
-    filas_mes = movimientos_del_mes(perfil_id, inicio, fin)
-    gastos = [r for r in filas_mes if r["tipo"] == "Gasto"]
-
-    st.subheader(f"Desglose de {MESES[mes - 1]} {anio}")
-    if gastos:
-        datos = pd.DataFrame([dict(r) for r in gastos])
-        categorias = (
-            datos.groupby("categoria", as_index=False)["monto"]
-            .sum()
-            .rename(columns={"categoria": "Categoría", "monto": "Monto"})
-        )
-        metodos = (
-            datos.groupby("metodo_pago", as_index=False)["monto"]
-            .sum()
-            .rename(columns={"metodo_pago": "Método de pago", "monto": "Monto"})
-        )
-
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(
-            px.pie(
-                categorias,
-                names="Categoría",
-                values="Monto",
-                hole=0.42,
-                title="Gastos por categoría",
-            ),
-            use_container_width=True,
-        )
-        c2.plotly_chart(
-            px.bar(
-                metodos,
-                x="Método de pago",
-                y="Monto",
-                color="Método de pago",
-                title="Gastos por método de pago",
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("No hay gastos registrados para ese mes.")
-
-    st.subheader(f"Resumen mensual de {anio}")
-    if filas_anio:
-        datos = pd.DataFrame([dict(r) for r in filas_anio])
-        datos["mes_numero"] = pd.to_datetime(datos["fecha_hora"]).dt.month
-        resumen = datos.pivot_table(
-            index="mes_numero",
-            columns="tipo",
-            values="monto",
-            aggfunc="sum",
-            fill_value=0,
-        ).reindex(range(1, 13), fill_value=0)
-
-        resumen = resumen.rename(
-            columns={"Ingreso": "Ingresos", "Gasto": "Gastos"}
-        )
-        resumen.index = [MESES[i - 1] for i in resumen.index]
-        datos_grafica = resumen.reset_index(names="Mes").melt(
-            id_vars="Mes",
-            var_name="Tipo",
-            value_name="Monto",
-        )
-
-        st.plotly_chart(
-            px.bar(
-                datos_grafica,
-                x="Mes",
-                y="Monto",
-                color="Tipo",
-                barmode="group",
-                title="Ingresos y gastos por mes",
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("No hay movimientos registrados para ese año.")
-
-    st.divider()
-    st.subheader("Exportar información")
-    st.caption(
-        "El archivo incluye todos los perfiles, movimientos, presupuestos, "
-        "obligaciones, deudas y metas."
-    )
-    st.download_button(
-        "Descargar todos los datos en CSV",
-        data=exportar_csv(),
-        file_name=f"finanzas_personales_{date.today().isoformat()}.csv",
-        mime="text/csv",
-        type="primary",
-    )
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title="Finanzas personales",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    inicializar_base()
-    perfiles = consultar("SELECT id, nombre FROM perfiles ORDER BY nombre")
-    perfil_id, perfil = elegir_perfil(perfiles)
-    aplicar_tema(bool(st.session_state.get("modo_oscuro", False)))
-
-    pagina = st.sidebar.radio(
-        "Secciones",
+    debt_frame = pd.DataFrame(
         [
-            "Inicio",
-            "Movimientos",
-            "Presupuesto",
-            "Deudas",
-            "Metas de ahorro",
-            "Reportes",
-        ],
-        label_visibility="collapsed",
+            {
+                "Acreedor": row["creditor"],
+                "Saldo pendiente": money(row["remaining_balance"]),
+                "Tasa anual": f"{row['interest_rate']:.2f}%",
+                "Cuotas": (
+                    f"{row['installments_left']} "
+                    f"de {row['total_installments']}"
+                ),
+                "Cuota mensual": money(row["monthly_payment"]),
+                "Próximo vencimiento": next_due_date(
+                    row["due_day"]
+                ).strftime("%d/%m/%Y"),
+            }
+            for row in debts
+        ]
     )
 
-    if pagina == "Inicio":
-        mostrar_inicio(perfil_id, perfil)
-    elif pagina == "Movimientos":
-        mostrar_movimientos(perfil_id)
-    elif pagina == "Presupuesto":
-        mostrar_presupuesto(perfil_id)
-    elif pagina == "Deudas":
-        mostrar_deudas(perfil_id)
-    elif pagina == "Metas de ahorro":
-        mostrar_metas(perfil_id)
-    else:
-        mostrar_reportes(perfil_id)
+    st.dataframe(debt_frame, use_container_width=True, hide_index=True) **…**
 
-
-if __name__ == "__main__":
-    main()
+_This response is too long to display in full._
